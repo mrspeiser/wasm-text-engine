@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Wasm Text Engine</title>
+    <link rel="stylesheet" href="./styles.css">
+</head>
+<body>
+    <div class="wrap">
+        <header class="site-header">
+            <div>
+                <p class="eyebrow">Local file benchmark</p>
+                <h1>Wasm Text Engine</h1>
+            </div>
+            <p id="wasm-status" class="status-pill" data-state="loading">Loading WebAssembly…</p>
+        </header>
+
+        <p class="lede">
+            Count newline bytes (<code>0x0A</code>) in a local text file.
+            JavaScript and Rust compiled to WebAssembly scan the same chunks.
+            The file is not uploaded.
+        </p>
+
+        <main>
+            <section class="panel" aria-labelledby="file-heading">
+                <h2 id="file-heading">File</h2>
+                <div id="dropzone" class="dropzone">
+                    <p class="dropzone-title">Drop a text file here</p>
+                    <p class="muted">TXT, CSV, JSON, LOG, or any other bytes. The scan does not parse a format.</p>
+                    <button type="button" id="choose-file" class="ghost">Choose file</button>
+                    <input id="file-input" type="file">
+                </div>
+                <dl id="file-meta" class="meta hidden">
+                    <div>
+                        <dt>Name</dt>
+                        <dd id="file-name"></dd>
+                    </div>
+                    <div>
+                        <dt>Size</dt>
+                        <dd id="file-size"></dd>
+                    </div>
+                    <div>
+                        <dt>Type</dt>
+                        <dd id="file-type"></dd>
+                    </div>
+                </dl>
+            </section>
+
+            <section class="panel" aria-labelledby="config-heading">
+                <h2 id="config-heading">Configuration</h2>
+                <div class="controls">
+                    <fieldset>
+                        <legend>Engine</legend>
+                        <label><input type="radio" name="engine" value="javascript"> JavaScript</label>
+                        <label><input type="radio" name="engine" value="wasm"> Rust / WebAssembly</label>
+                        <label><input type="radio" name="engine" value="both" checked> Run both</label>
+                    </fieldset>
+                    <label class="field">
+                        Chunk size
+                        <select id="chunk-size">
+                            <option value="1048576">1 MiB</option>
+                            <option value="2097152">2 MiB</option>
+                            <option value="4194304" selected>4 MiB</option>
+                        </select>
+                    </label>
+                    <label class="field">
+                        Iterations
+                        <select id="iterations">
+                            <option value="1" selected>1</option>
+                            <option value="3">3</option>
+                            <option value="5">5</option>
+                        </select>
+                    </label>
+                    <div class="actions">
+                        <button type="button" id="run-button" class="primary" disabled>Run benchmark</button>
+                        <button type="button" id="cancel-button" class="ghost" disabled>Cancel</button>
+                    </div>
+                </div>
+                <p class="hint">Each iteration reads the file again. Reported times are the median of those iterations. JavaScript runs before WebAssembly when both are selected.</p>
+            </section>
+
+            <section class="panel" aria-labelledby="progress-heading">
+                <h2 id="progress-heading">Progress</h2>
+                <p id="run-status" role="status" aria-live="polite">Choose a file to begin.</p>
+                <div
+                    id="progress"
+                    class="progress"
+                    role="progressbar"
+                    aria-valuemin="0"
+                    aria-valuemax="100"
+                    aria-valuenow="0"
+                    aria-label="Benchmark progress"
+                >
+                    <div id="progress-fill" class="progress-fill"></div>
+                </div>
+                <dl class="stats">
+                    <div>
+                        <dt>This iteration</dt>
+                        <dd id="stat-bytes">—</dd>
+                    </div>
+                    <div>
+                        <dt>Complete</dt>
+                        <dd id="stat-percent">—</dd>
+                    </div>
+                    <div>
+                        <dt>Elapsed</dt>
+                        <dd id="stat-elapsed">—</dd>
+                    </div>
+                    <div>
+                        <dt>Processing throughput</dt>
+                        <dd id="stat-throughput">—</dd>
+                    </div>
+                </dl>
+            </section>
+
+            <section class="panel" aria-labelledby="results-heading">
+                <h2 id="results-heading">Results</h2>
+                <div id="results" class="results"></div>
+                <div id="comparison" class="comparison">
+                    <p class="muted">Run both engines to compare them on the same file.</p>
+                </div>
+            </section>
+
+            <section class="panel" aria-labelledby="metrics-heading">
+                <h2 id="metrics-heading">What the numbers measure</h2>
+                <dl class="glossary">
+                    <div>
+                        <dt>Read time</dt>
+                        <dd>Time spent waiting on <code>slice().arrayBuffer()</code>. Both engines use the same reads. It is kept separate from the scan.</dd>
+                    </div>
+                    <div>
+                        <dt>JavaScript scan time</dt>
+                        <dd>Time inside the loop over a <code>Uint8Array</code> that counts <code>0x0A</code>, after the chunk is already in memory.</dd>
+                    </div>
+                    <div>
+                        <dt>Wasm call time</dt>
+                        <dd>Time inside <code>append_chunk</code>. <code>wasm-bindgen</code> copies the typed array into WebAssembly memory, then Rust scans that copy. The copy is included because a caller pays it.</dd>
+                    </div>
+                    <div>
+                        <dt>Estimated transfer</dt>
+                        <dd>After the timed iterations, the worker times <code>probe_transfer</code> on about 10 chunks. That call copies the bytes and returns the length. The median time per byte is scaled to the file size. It is an estimate, not a second pass over the whole file, and it is not included in the totals.</dd>
+                    </div>
+                    <div>
+                        <dt>Estimated Wasm scan</dt>
+                        <dd>Wasm call time minus the estimated transfer. If that difference is negative, the scan was smaller than the noise in the estimate and the value is omitted.</dd>
+                    </div>
+                    <div>
+                        <dt>End-to-end time</dt>
+                        <dd>Wall time for one iteration inside the worker, from the first read through the last counted byte. Drawing this page is outside the timer. A combined run reads the file for JavaScript first, so WebAssembly may then see a warmer operating-system cache. Use scan time and call time to compare processing. Read time is shown so that cache effect stays visible.</dd>
+                    </div>
+                    <div>
+                        <dt>Throughput</dt>
+                        <dd>File size divided by the median processing time, and again by the median end-to-end time. 1 MiB is 1024 × 1024 bytes.</dd>
+                    </div>
+                    <div>
+                        <dt>Newline count</dt>
+                        <dd>Bytes equal to <code>0x0A</code>. Carriage returns are not counted. The count does not depend on chunk size. A mismatch means the comparison is invalid.</dd>
+                    </div>
+                </dl>
+            </section>
+
+            <section class="panel" aria-labelledby="preview-heading">
+                <h2 id="preview-heading">Preview</h2>
+                <p id="preview-meta" class="muted">The first 64 KiB are decoded as UTF-8. The benchmark itself counts bytes and does not decode the file.</p>
+                <pre id="preview-text" class="preview">Select a file to preview its first 64 KiB.</pre>
+            </section>
+        </main>
+    </div>
+    <script type="module" src="./main.js"></script>
+</body>
+</html>
