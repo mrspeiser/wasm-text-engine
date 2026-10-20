@@ -1,0 +1,4 @@
+/target/
+/pkg/
+**/test-data/
+.DS_Store

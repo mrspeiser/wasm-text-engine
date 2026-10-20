@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Rust + WebAssembly</title>
+</head>
+<body>
+    <h1>Rust + WebAssembly</h1>
+    <p id="result">Loading...</p>
+
+    <script type="module">
+        import init, { add, uppercase } from "./pkg/rust_wasm_playground.js";
+
+        async function main() {
+            await init();
+
+            const result = add(5, 10);
+
+            document.getElementById("result").textContent =
+                `Result from Rust: ${result}`;
+
+            const message = uppercase("hello from javascript");
+            document.body.appendChild(document.createElement("p")).textContent = `Message from Rust: ${message}`;
+            const fileinput = document.createElement("input");
+            fileinput.type = "file";
+            fileinput.addEventListener("change", (event) => {
+                const file = event.target.files[0];
+                const reader = new FileReader();
+
+                reader.onload = (event) => {
+                    const message = uppercase(event.target.result);
+                    document.body.appendChild(document.createElement("p")).textContent = `File content from Rust: ${message}`;
+                };
+
+                reader.readAsText(file);
+            });
+
+            document.body.appendChild(fileinput);
+        }
+
+        main().catch(console.error);
+    </script>
+</body>
+</html>
