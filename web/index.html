@@ -74,6 +74,7 @@
                     </label>
                     <div class="actions">
                         <button type="button" id="run-button" class="primary" disabled>Run benchmark</button>
+                        <button type="button" id="summarize-button" class="ghost" disabled>Summarize</button>
                         <button type="button" id="cancel-button" class="ghost" disabled>Cancel</button>
                     </div>
                 </div>
@@ -120,6 +121,39 @@
                 <div id="comparison" class="comparison">
                     <p class="muted">Run both engines to compare them on the same file.</p>
                 </div>
+            </section>
+
+            <section class="panel" aria-labelledby="summary-heading">
+                <h2 id="summary-heading">File statistics</h2>
+                <p class="hint">A separate pass over the same chunks. It is not part of the benchmark timings.</p>
+                <dl id="summary" class="summary-grid">
+                    <div><dt>Bytes</dt><dd id="summary-bytes">—</dd></div>
+                    <div><dt>Scalars</dt><dd id="summary-scalars">—</dd></div>
+                    <div><dt>Invalid sequences</dt><dd id="summary-invalid">—</dd></div>
+                    <div><dt>Newlines</dt><dd id="summary-newlines">—</dd></div>
+                    <div><dt>CRLF pairs</dt><dd id="summary-crlf">—</dd></div>
+                    <div><dt>Lines</dt><dd id="summary-lines">—</dd></div>
+                    <div><dt>Longest line, bytes</dt><dd id="summary-longest-bytes">—</dd></div>
+                    <div><dt>Longest line, scalars</dt><dd id="summary-longest-scalars">—</dd></div>
+                </dl>
+                <dl class="glossary">
+                    <div>
+                        <dt>Scalars</dt>
+                        <dd>Unicode scalar values. Each maximal ill-formed UTF-8 subsequence counts as one replacement.</dd>
+                    </div>
+                    <div>
+                        <dt>Lines</dt>
+                        <dd>A <code>0x0A</code> byte ends a line. A final non-empty line with no newline counts. An empty file has zero lines. A bare carriage return does not end a line.</dd>
+                    </div>
+                    <div>
+                        <dt>CRLF pairs</dt>
+                        <dd>Newlines whose previous byte was <code>0x0D</code>, including when that pair is split across two chunks. They are also included in the newline count.</dd>
+                    </div>
+                    <div>
+                        <dt>Longest line</dt>
+                        <dd>Excludes the newline and, for a CRLF pair, excludes the carriage return as well.</dd>
+                    </div>
+                </dl>
             </section>
 
             <section class="panel" aria-labelledby="metrics-heading">

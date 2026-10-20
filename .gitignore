@@ -2,3 +2,4 @@
 /pkg/
 **/test-data/
 .DS_Store
+commit-message.txt

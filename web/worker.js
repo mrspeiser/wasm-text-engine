@@ -135,6 +135,12 @@ self.onmessage = (event) => {
   if (message.type === "benchmark") {
     activeRunId = message.runId;
     enqueue(() => handleBenchmark(message));
+    return;
+  }
+
+  if (message.type === "stats") {
+    activeRunId = message.runId;
+    enqueue(() => handleStats(message));
   }
 };
 
@@ -246,11 +252,116 @@ async function handleBenchmark(message) {
   }
 }
 
-function validate(message) {
+async function handleStats(message) {
+  let stats = null;
+  try {
+    const { file, chunkSize } = requireFile(message);
+    ensureActive(message.runId);
+    const wasm = await wasmReady;
+    ensureActive(message.runId);
+    stats = new wasm.WasmTextStats();
+    const runStarted = performance.now();
+    let bytesProcessed = 0;
+    let processMs = 0;
+    let lastProgress = 0;
+
+    if (file.size === 0) {
+      postStatsProgress({
+        runId: message.runId,
+        bytesProcessed: 0,
+        fileSize: 0,
+        runStarted,
+        processMs: 0,
+      });
+    }
+
+    for (let offset = 0; offset < file.size; offset += chunkSize) {
+      ensureActive(message.runId);
+      const bytes = await readChunk(file, offset, chunkSize);
+      const processStarted = performance.now();
+      stats.push_chunk(bytes);
+      processMs += performance.now() - processStarted;
+      bytesProcessed += bytes.length;
+
+      const now = performance.now();
+      if (bytesProcessed === file.size || now - lastProgress >= PROGRESS_INTERVAL_MS) {
+        lastProgress = now;
+        postStatsProgress({
+          runId: message.runId,
+          bytesProcessed,
+          fileSize: file.size,
+          runStarted,
+          processMs,
+        });
+      }
+    }
+
+    ensureActive(message.runId);
+    stats.finish();
+    const summary = readSummary(stats);
+    if (summary.bytes !== file.size) {
+      throw new Error(`Summarized ${summary.bytes} bytes, but the file is ${file.size} bytes.`);
+    }
+    post({ type: "stats", runId: message.runId, summary });
+    ensureActive(message.runId);
+    post({ type: "done", runId: message.runId, kind: "stats" });
+  } catch (error) {
+    if (error.name === "CancelledError" || activeRunId !== message.runId) {
+      post({ type: "cancelled", runId: message.runId, kind: "stats" });
+      return;
+    }
+    post({
+      type: "error",
+      runId: message.runId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    stats?.free();
+    if (activeRunId === message.runId) {
+      activeRunId = null;
+    }
+  }
+}
+
+function postStatsProgress({ runId, bytesProcessed, fileSize, runStarted, processMs }) {
+  post({
+    type: "progress",
+    runId,
+    phase: "stats",
+    bytesProcessed,
+    fileSize,
+    percent: fileSize === 0 ? 100 : (bytesProcessed / fileSize) * 100,
+    runElapsedMs: performance.now() - runStarted,
+    processThroughputMibS: throughputMibPerSec(bytesProcessed, processMs),
+  });
+}
+
+function readSummary(stats) {
+  return {
+    bytes: toSafeNumber(stats.bytes(), "Bytes"),
+    scalars: toSafeNumber(stats.scalars(), "Scalars"),
+    invalidSequences: toSafeNumber(stats.invalid_sequences(), "Invalid sequences"),
+    newlineCount: toSafeNumber(stats.newline_count(), "Newline count"),
+    crlfCount: toSafeNumber(stats.crlf_count(), "CRLF count"),
+    lineCount: toSafeNumber(stats.line_count(), "Line count"),
+    longestLineBytes: toSafeNumber(stats.longest_line_bytes(), "Longest line bytes"),
+    longestLineScalars: toSafeNumber(stats.longest_line_scalars(), "Longest line scalars"),
+  };
+}
+
+function requireFile(message) {
   const file = message.file;
   if (!file || typeof file.size !== "number" || typeof file.slice !== "function") {
-    throw new Error("Choose a file before running a benchmark.");
+    throw new Error("Choose a file before running.");
   }
+  if (!ALLOWED_CHUNK_SIZES.has(message.chunkSize)) {
+    throw new Error("Chunk size must be 1, 2, or 4 MiB.");
+  }
+  return { file, chunkSize: message.chunkSize };
+}
+
+function validate(message) {
+  const { file, chunkSize } = requireFile(message);
 
   const engines = message.engines;
   if (!Array.isArray(engines) || engines.length < 1 || engines.length > 2) {
@@ -260,11 +371,6 @@ function validate(message) {
   const known = [...unique].every((engine) => engine === "javascript" || engine === "wasm");
   if (unique.size !== engines.length || !known) {
     throw new Error("Unknown engine selection.");
-  }
-
-  const chunkSize = message.chunkSize;
-  if (!ALLOWED_CHUNK_SIZES.has(chunkSize)) {
-    throw new Error("Chunk size must be 1, 2, or 4 MiB.");
   }
 
   const iterations = message.iterations;

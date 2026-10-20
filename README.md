@@ -18,11 +18,12 @@ main thread                worker                         Rust / Wasm
 file picker, drop zone     slice the File into chunks    TextProcessor
 progress and results       JavaScript newline loop       append_chunk(&[u8])
 64 KiB preview             WasmProcessor                 count of 0x0A
+Summarize                  a separate stats pass         TextStats
 ```
 
 The main thread sends the `File` with `postMessage`. Structured clone hands the worker a file handle; it does not copy the body. The worker reads `file.slice(start, end).arrayBuffer()` in 1, 2, or 4 MiB chunks, then drops the chunk after counting it.
 
-`TextProcessor` in [`src/processor.rs`](src/processor.rs) is ordinary Rust. It tracks `bytes_seen` and `newline_count` as `u64` values and can be reset. [`src/lib.rs`](src/lib.rs) is the `wasm-bindgen` adapter: `WasmProcessor` plus `probe_transfer`, a call that copies a chunk and returns its length so the benchmark can estimate transfer cost.
+`TextProcessor` in [`src/processor.rs`](src/processor.rs) is ordinary Rust. It tracks `bytes_seen` and `newline_count` as `u64` values and can be reset. [`src/lib.rs`](src/lib.rs) is the `wasm-bindgen` adapter: `WasmProcessor` plus `probe_transfer`, a call that copies a chunk and returns its length so the benchmark can estimate transfer cost. [`TextStats`](src/stats.rs) is a second type for scalars, CRLF pairs, and line length. The benchmark does not call it.
 
 A newline is one byte, so a chunk boundary cannot split one. Carriage return (`0x0D`) is not counted. Tests split buffers at every offset and check that the total matches a single pass.
 
@@ -74,6 +75,18 @@ In a combined run, JavaScript finishes every iteration before WebAssembly starts
 
 The two newline counts have to match, and the bytes seen have to equal the file size. If they do not, the page says the comparison is invalid.
 
+## File statistics
+
+Summarize runs a second Rust type, `TextStats`, over the same chunks. It is not inside the benchmark timers, and it does not change what `append_chunk` measures.
+
+The pass keeps two pieces of state between chunks: at most three undecided UTF-8 bytes, and whether the previous byte was a carriage return. After the last chunk, `finish()` closes a partial character and the open line.
+
+- **Newlines** are still bytes equal to `0x0A`, the same count as the benchmark.
+- **CRLF pairs** are newlines whose previous byte was `0x0D`. The pair still counts as one newline. A pair split across two chunks is one pair. A bare carriage return does not end a line.
+- **Lines** are separated by newlines. A final non-empty line with no newline counts. An empty file has zero lines.
+- **Scalars** are Unicode scalar values. Each maximal ill-formed UTF-8 subsequence counts as one replacement, and `invalid sequences` counts those subsequences. A character split across chunks is one scalar, not two.
+- **Longest line** excludes the newline and, for a CRLF pair, excludes the carriage return as well. It is reported in bytes and in scalars.
+
 ## Tradeoffs
 
 - Chunked reads keep memory to about one chunk, plus the WebAssembly copy of that chunk. A multi-gigabyte file is not turned into a JavaScript string.
@@ -90,6 +103,7 @@ The two newline counts have to match, and the bytes seen have to equal the file 
 - Progress, elapsed time, processing throughput, and cancel.
 - Side-by-side medians, throughput, and a count check.
 - A UTF-8 preview of the first 64 KiB.
+- A separate statistics pass: scalars, invalid UTF-8 sequences, CRLF pairs, line count, and the longest line.
 - Host unit tests for the Rust counter and `node --test` for the JavaScript counter.
 
 ## Planned features
@@ -106,12 +120,14 @@ cargo test
 node --test web/count-newlines.test.js
 ```
 
-`cargo test` runs on the host and does not need the browser package. The Rust tests cover empty input, input without newlines, repeated newlines, a split at every offset, a newline on either side of a boundary, reset, many chunks, totals past `u32::MAX`, and overflow that does not change the previous totals.
+`cargo test` runs on the host and does not need the browser package. The newline tests cover empty input, input without newlines, repeated newlines, a split at every offset, a newline on either side of a boundary, reset, many chunks, totals past `u32::MAX`, and overflow that does not change the previous totals. The statistics tests cover the same kind of split, plus a CRLF pair divided across two chunks, a partial UTF-8 character completed by the next chunk, and a truncated character closed by `finish()`.
 
 ## Layout
 
 ```text
-src/processor.rs          chunked counter
+src/processor.rs          newline counter used by the benchmark
+src/utf8.rs               one UTF-8 unit at a time
+src/stats.rs              streaming line and scalar totals
 src/lib.rs                wasm-bindgen adapter
 web/                      page, worker, and JavaScript scan
 scripts/generate_test_file.py

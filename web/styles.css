@@ -231,6 +231,7 @@ select {
 
 .actions {
     display: flex;
+    flex-wrap: wrap;
     gap: 8px;
     margin-left: auto;
 }
@@ -359,6 +360,19 @@ button:disabled {
 .banner.ok { color: var(--ok); }
 .banner.error { color: var(--danger); }
 
+.summary-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 12px;
+    margin: 14px 0 18px;
+}
+
+.summary-grid dd {
+    margin: 2px 0 0;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-variant-numeric: tabular-nums;
+}
+
 .glossary {
     display: grid;
     gap: 12px;
@@ -407,7 +421,7 @@ button:disabled {
         grid-template-columns: 1fr;
     }
 
-    .meta, .stats, .results {
+    .meta, .stats, .results, .summary-grid {
         grid-template-columns: 1fr 1fr;
     }
 
@@ -417,7 +431,7 @@ button:disabled {
 }
 
 @media (max-width: 560px) {
-    .meta, .stats, .results {
+    .meta, .stats, .results, .summary-grid {
         grid-template-columns: 1fr;
     }
 }

@@ -12,6 +12,7 @@ const dom = {
   chunkSize: document.querySelector("#chunk-size"),
   iterations: document.querySelector("#iterations"),
   runButton: document.querySelector("#run-button"),
+  summarizeButton: document.querySelector("#summarize-button"),
   cancelButton: document.querySelector("#cancel-button"),
   runStatus: document.querySelector("#run-status"),
   progress: document.querySelector("#progress"),
@@ -24,6 +25,16 @@ const dom = {
   comparison: document.querySelector("#comparison"),
   previewMeta: document.querySelector("#preview-meta"),
   previewText: document.querySelector("#preview-text"),
+  summary: {
+    bytes: document.querySelector("#summary-bytes"),
+    scalars: document.querySelector("#summary-scalars"),
+    invalid: document.querySelector("#summary-invalid"),
+    newlines: document.querySelector("#summary-newlines"),
+    crlf: document.querySelector("#summary-crlf"),
+    lines: document.querySelector("#summary-lines"),
+    longestBytes: document.querySelector("#summary-longest-bytes"),
+    longestScalars: document.querySelector("#summary-longest-scalars"),
+  },
 };
 
 const state = {
@@ -77,6 +88,7 @@ dom.dropzone.addEventListener("drop", (event) => {
 });
 
 dom.runButton.addEventListener("click", startRun);
+dom.summarizeButton.addEventListener("click", startSummary);
 dom.cancelButton.addEventListener("click", () => {
   worker.postMessage({ type: "cancel", runId: state.runId });
   setRunStatus("Cancelling…");
@@ -131,14 +143,21 @@ function onWorkerMessage(event) {
     case "comparison":
       renderComparison(message.comparison);
       break;
+    case "stats":
+      renderSummary(message.summary);
+      break;
     case "done":
       state.running = false;
-      setRunStatus("Benchmark finished.");
+      setRunStatus(message.kind === "stats" ? "Summary finished." : "Benchmark finished.");
       renderControls();
       break;
     case "cancelled":
       state.running = false;
-      setRunStatus("Cancelled. Results from engines that finished are still listed.");
+      setRunStatus(
+        message.kind === "stats"
+          ? "Summary cancelled."
+          : "Cancelled. Results from engines that finished are still listed.",
+      );
       dom.progress.classList.remove("is-probe");
       renderControls();
       break;
@@ -166,6 +185,7 @@ function selectFile(file) {
   dom.fileType.textContent = file.type || "Unknown";
   dom.fileMeta.classList.remove("hidden");
   resetProgress();
+  clearSummary();
   setRunStatus("Ready to run.");
   renderResults();
   clearComparison();
@@ -210,6 +230,25 @@ function startRun() {
   });
 }
 
+function startSummary() {
+  if (!state.file || state.running || !state.wasmReady) {
+    return;
+  }
+
+  state.running = true;
+  state.runId += 1;
+  clearSummary();
+  resetProgress();
+  setRunStatus("Summarizing…");
+  renderControls();
+  worker.postMessage({
+    type: "stats",
+    runId: state.runId,
+    file: state.file,
+    chunkSize: Number(dom.chunkSize.value),
+  });
+}
+
 function selectedEngine() {
   return document.querySelector('input[name="engine"]:checked')?.value ?? "both";
 }
@@ -228,6 +267,7 @@ function canRun() {
 function renderControls() {
   const locked = state.running;
   dom.runButton.disabled = !canRun();
+  dom.summarizeButton.disabled = locked || !state.file || !state.wasmReady;
   dom.cancelButton.disabled = !locked;
   dom.chooseFile.disabled = locked;
   dom.fileInput.disabled = locked;
@@ -248,6 +288,15 @@ function renderProgress(progress) {
     setRunStatus("Estimating WebAssembly copy overhead…");
     dom.statPercent.textContent = formatPercent(percent);
     dom.statElapsed.textContent = formatMs(progress.runElapsedMs);
+    return;
+  }
+
+  if (progress.phase === "stats") {
+    setRunStatus("Summarizing…");
+    dom.statBytes.textContent = `${formatBytes(progress.bytesProcessed)} / ${formatBytes(progress.fileSize)}`;
+    dom.statPercent.textContent = formatPercent(percent);
+    dom.statElapsed.textContent = formatMs(progress.runElapsedMs);
+    dom.statThroughput.textContent = formatThroughput(progress.processThroughputMibS);
     return;
   }
 
@@ -377,6 +426,23 @@ function renderPreview(message) {
     ? `Entire file (${formatBytes(message.fileSize)}), decoded as UTF-8. The benchmark counts bytes and does not decode text.`
     : `First ${formatBytes(message.byteLength)} of ${formatBytes(message.fileSize)}, decoded as UTF-8. The benchmark counts bytes and does not decode text.`;
   dom.previewText.textContent = message.text.length > 0 ? message.text : "(preview is empty)";
+}
+
+function renderSummary(summary) {
+  dom.summary.bytes.textContent = formatInt(summary.bytes);
+  dom.summary.scalars.textContent = formatInt(summary.scalars);
+  dom.summary.invalid.textContent = formatInt(summary.invalidSequences);
+  dom.summary.newlines.textContent = formatInt(summary.newlineCount);
+  dom.summary.crlf.textContent = formatInt(summary.crlfCount);
+  dom.summary.lines.textContent = formatInt(summary.lineCount);
+  dom.summary.longestBytes.textContent = formatInt(summary.longestLineBytes);
+  dom.summary.longestScalars.textContent = formatInt(summary.longestLineScalars);
+}
+
+function clearSummary() {
+  for (const node of Object.values(dom.summary)) {
+    node.textContent = "—";
+  }
 }
 
 function resetProgress() {
