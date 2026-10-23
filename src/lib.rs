@@ -6,11 +6,15 @@
 //! linear memory before either call, and the benchmark does not pay for the
 //! statistics pass.
 
+mod index;
 mod processor;
+mod search;
 mod stats;
 mod utf8;
 
+pub use index::{LineIndex, LineRange};
 pub use processor::{CounterOverflow, TextProcessor, count_newlines};
+pub use search::{ByteSearch, EmptyPattern, SearchHit, STORED_HIT_LIMIT};
 pub use stats::TextStats;
 pub use utf8::{DecodeStep, next_unit};
 
@@ -129,5 +133,110 @@ impl WasmTextStats {
 
     pub fn longest_line_scalars(&self) -> u64 {
         self.inner.longest_line_scalars()
+    }
+}
+
+/// Exact byte search exposed to JavaScript.
+///
+/// The newline benchmark does not use this type. At most 100 hits are kept.
+/// [`match_count`](Self::match_count) still counts the rest.
+#[wasm_bindgen]
+pub struct WasmSearch {
+    inner: ByteSearch,
+}
+
+#[wasm_bindgen]
+impl WasmSearch {
+    #[wasm_bindgen(constructor)]
+    pub fn new(pattern: &[u8]) -> Result<WasmSearch, JsValue> {
+        ByteSearch::new(pattern)
+            .map(|inner| WasmSearch { inner })
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
+        self.inner
+            .push_chunk(chunk)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    pub fn bytes_seen(&self) -> u64 {
+        self.inner.bytes_seen()
+    }
+
+    pub fn match_count(&self) -> u64 {
+        self.inner.match_count()
+    }
+
+    pub fn hit_count(&self) -> u32 {
+        u32::try_from(self.inner.hits().len()).expect("hit list longer than u32::MAX")
+    }
+
+    pub fn hit_offset(&self, index: u32) -> Result<u64, JsValue> {
+        self.inner
+            .hits()
+            .get(index as usize)
+            .map(|hit| hit.offset)
+            .ok_or_else(|| JsValue::from_str("hit index out of range"))
+    }
+
+    pub fn hit_line(&self, index: u32) -> Result<u64, JsValue> {
+        self.inner
+            .hits()
+            .get(index as usize)
+            .map(|hit| hit.line)
+            .ok_or_else(|| JsValue::from_str("hit index out of range"))
+    }
+}
+
+/// Newline offset index exposed to JavaScript.
+///
+/// Built during Summarize. [`line_start`](Self::line_start) and
+/// [`line_end`](Self::line_end) take a 1-based line number. `line_end` is the
+/// offset of the newline, or the file length when the last line has none.
+#[wasm_bindgen]
+pub struct WasmLineIndex {
+    inner: LineIndex,
+}
+
+#[wasm_bindgen]
+impl WasmLineIndex {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmLineIndex {
+        WasmLineIndex {
+            inner: LineIndex::new(),
+        }
+    }
+
+    pub fn push_chunk(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
+        self.inner
+            .push_chunk(chunk)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    pub fn bytes_seen(&self) -> u64 {
+        self.inner.bytes_seen()
+    }
+
+    pub fn newline_count(&self) -> u64 {
+        self.inner.newline_count()
+    }
+
+    pub fn line_count(&self) -> u64 {
+        self.inner.line_count()
+    }
+
+    pub fn line_start(&self, line: u64) -> Result<u64, JsValue> {
+        self.inner
+            .line_range(line)
+            .map(|range| range.start)
+            .ok_or_else(|| JsValue::from_str("line is out of range"))
+    }
+
+    pub fn line_end(&self, line: u64) -> Result<u64, JsValue> {
+        self.inner
+            .line_range(line)
+            .map(|range| range.end)
+            .ok_or_else(|| JsValue::from_str("line is out of range"))
     }
 }

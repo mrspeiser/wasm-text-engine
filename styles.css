@@ -413,6 +413,70 @@ button:disabled {
     line-height: 1.45;
 }
 
+.tool-row {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: end;
+    margin-top: 14px;
+}
+
+.tool-field {
+    display: grid;
+    gap: 8px;
+    flex: 1 1 240px;
+    color: var(--muted);
+    font-size: 0.78rem;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.line-field {
+    flex: 0 1 160px;
+}
+
+input[type="text"],
+input[type="number"] {
+    background: var(--bg-inset);
+    color: var(--text);
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 8px 10px;
+    text-transform: none;
+    letter-spacing: 0;
+    font-size: 0.95rem;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
+.hits {
+    display: grid;
+    gap: 12px;
+}
+
+.hit-title {
+    margin: 0;
+    color: var(--muted);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.82rem;
+}
+
+.hit-window {
+    margin: 0;
+    max-height: 160px;
+}
+
+mark {
+    background: var(--accent);
+    color: var(--accent-ink);
+    border-radius: 3px;
+    padding: 0 2px;
+}
+
+#line-heading {
+    margin: 22px 0 14px;
+    font-size: 1.05rem;
+}
+
 .hidden { display: none !important; }
 
 @media (max-width: 800px) {

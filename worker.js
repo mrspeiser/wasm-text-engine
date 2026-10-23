@@ -23,10 +23,15 @@ const ALLOWED_CHUNK_SIZES = new Set([1 * MIB, 2 * MIB, 4 * MIB]);
 const ALLOWED_ITERATIONS = new Set([1, 3, 5]);
 const PROBE_SAMPLES = 10;
 const PROGRESS_INTERVAL_MS = 100;
+const MAX_PATTERN_BYTES = 1024;
+const CONTEXT_BYTES = 48;
+const MAX_LINE_PREVIEW = 8 * 1024;
 
 let wasmReady = null;
 let activeRunId = null;
 let tail = Promise.resolve();
+let lineIndex = null;
+let lineIndexFileId = null;
 
 function post(message) {
   self.postMessage(message);
@@ -90,7 +95,7 @@ function ratio(numerator, denominator) {
 }
 
 async function loadWasm() {
-  const wasm = await import("../pkg/wasm_text_engine.js");
+  const wasm = await import("./pkg/wasm_text_engine.js");
   await wasm.default();
   return wasm;
 }
@@ -141,6 +146,25 @@ self.onmessage = (event) => {
   if (message.type === "stats") {
     activeRunId = message.runId;
     enqueue(() => handleStats(message));
+    return;
+  }
+
+  if (message.type === "search") {
+    activeRunId = message.runId;
+    enqueue(() => handleSearch(message));
+    return;
+  }
+
+  if (message.type === "line") {
+    activeRunId = message.runId;
+    enqueue(() => handleLine(message));
+    return;
+  }
+
+  if (message.type === "drop-index") {
+    enqueue(() => {
+      dropLineIndex();
+    });
   }
 };
 
@@ -254,12 +278,14 @@ async function handleBenchmark(message) {
 
 async function handleStats(message) {
   let stats = null;
+  let index = null;
   try {
     const { file, chunkSize } = requireFile(message);
     ensureActive(message.runId);
     const wasm = await wasmReady;
     ensureActive(message.runId);
     stats = new wasm.WasmTextStats();
+    index = new wasm.WasmLineIndex();
     const runStarted = performance.now();
     let bytesProcessed = 0;
     let processMs = 0;
@@ -280,6 +306,7 @@ async function handleStats(message) {
       const bytes = await readChunk(file, offset, chunkSize);
       const processStarted = performance.now();
       stats.push_chunk(bytes);
+      index.push_chunk(bytes);
       processMs += performance.now() - processStarted;
       bytesProcessed += bytes.length;
 
@@ -299,9 +326,18 @@ async function handleStats(message) {
     ensureActive(message.runId);
     stats.finish();
     const summary = readSummary(stats);
-    if (summary.bytes !== file.size) {
+    const indexedBytes = toSafeNumber(index.bytes_seen(), "Indexed bytes");
+    const indexedLines = toSafeNumber(index.line_count(), "Indexed lines");
+    if (summary.bytes !== file.size || indexedBytes !== file.size) {
       throw new Error(`Summarized ${summary.bytes} bytes, but the file is ${file.size} bytes.`);
     }
+    if (indexedLines !== summary.lineCount) {
+      throw new Error(
+        `Line index has ${indexedLines} lines, but the summary counted ${summary.lineCount}.`,
+      );
+    }
+    retainLineIndex(index, message.fileId);
+    index = null;
     post({ type: "stats", runId: message.runId, summary });
     ensureActive(message.runId);
     post({ type: "done", runId: message.runId, kind: "stats" });
@@ -317,17 +353,221 @@ async function handleStats(message) {
     });
   } finally {
     stats?.free();
+    index?.free();
     if (activeRunId === message.runId) {
       activeRunId = null;
     }
   }
 }
 
-function postStatsProgress({ runId, bytesProcessed, fileSize, runStarted, processMs }) {
+async function handleSearch(message) {
+  let search = null;
+  try {
+    const { file, chunkSize } = requireFile(message);
+    const pattern = patternBytes(message.pattern);
+    ensureActive(message.runId);
+    const wasm = await wasmReady;
+    ensureActive(message.runId);
+    search = new wasm.WasmSearch(pattern);
+    const runStarted = performance.now();
+    let bytesProcessed = 0;
+    let processMs = 0;
+    let lastProgress = 0;
+
+    if (file.size === 0) {
+      postPassProgress({
+        runId: message.runId,
+        phase: "search",
+        bytesProcessed: 0,
+        fileSize: 0,
+        runStarted,
+        processMs: 0,
+      });
+    }
+
+    for (let offset = 0; offset < file.size; offset += chunkSize) {
+      ensureActive(message.runId);
+      const bytes = await readChunk(file, offset, chunkSize);
+      const processStarted = performance.now();
+      search.push_chunk(bytes);
+      processMs += performance.now() - processStarted;
+      bytesProcessed += bytes.length;
+
+      const now = performance.now();
+      if (bytesProcessed === file.size || now - lastProgress >= PROGRESS_INTERVAL_MS) {
+        lastProgress = now;
+        postPassProgress({
+          runId: message.runId,
+          phase: "search",
+          bytesProcessed,
+          fileSize: file.size,
+          runStarted,
+          processMs,
+        });
+      }
+    }
+
+    ensureActive(message.runId);
+    const matchCount = toSafeNumber(search.match_count(), "Match count");
+    const bytesSeen = toSafeNumber(search.bytes_seen(), "Bytes seen");
+    if (bytesSeen !== file.size) {
+      throw new Error(`Searched ${bytesSeen} bytes, but the file is ${file.size} bytes.`);
+    }
+
+    const hitCount = search.hit_count();
+    const hits = [];
+    if (hitCount > 0) {
+      postPassProgress({
+        runId: message.runId,
+        phase: "search-windows",
+        bytesProcessed: file.size,
+        fileSize: file.size,
+        runStarted,
+        processMs,
+      });
+    }
+    for (let index = 0; index < hitCount; index += 1) {
+      ensureActive(message.runId);
+      const offset = toSafeNumber(search.hit_offset(index), "Match offset");
+      const line = toSafeNumber(search.hit_line(index), "Match line");
+      const start = Math.max(0, offset - CONTEXT_BYTES);
+      const end = Math.min(file.size, offset + pattern.length + CONTEXT_BYTES);
+      const bytes = await readRange(file, start, end);
+      const relative = offset - start;
+      hits.push({
+        offset,
+        line,
+        before: decodeText(bytes.subarray(0, relative)),
+        match: decodeText(bytes.subarray(relative, relative + pattern.length)),
+        after: decodeText(bytes.subarray(relative + pattern.length)),
+      });
+    }
+
+    post({ type: "search", runId: message.runId, matchCount, hits });
+    ensureActive(message.runId);
+    post({ type: "done", runId: message.runId, kind: "search" });
+  } catch (error) {
+    if (error.name === "CancelledError" || activeRunId !== message.runId) {
+      post({ type: "cancelled", runId: message.runId, kind: "search" });
+      return;
+    }
+    post({
+      type: "error",
+      runId: message.runId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    search?.free();
+    if (activeRunId === message.runId) {
+      activeRunId = null;
+    }
+  }
+}
+
+async function handleLine(message) {
+  try {
+    const file = requireFileOnly(message);
+    ensureActive(message.runId);
+    if (!lineIndex || message.fileId !== lineIndexFileId) {
+      throw new Error("Summarize this file before jumping to a line.");
+    }
+    if (!Number.isSafeInteger(message.line) || message.line < 1) {
+      throw new Error("Enter a line number of 1 or more.");
+    }
+    const lineCount = toSafeNumber(lineIndex.line_count(), "Line count");
+    if (message.line > lineCount) {
+      throw new Error(
+        lineCount === 0
+          ? "This file has no lines."
+          : `Line ${message.line} is past the end of the file (${lineCount} lines).`,
+      );
+    }
+    const start = toSafeNumber(lineIndex.line_start(BigInt(message.line)), "Line start");
+    const end = toSafeNumber(lineIndex.line_end(BigInt(message.line)), "Line end");
+    if (end < start || start > file.size || end > file.size) {
+      throw new Error("The line index points outside the file.");
+    }
+    const truncated = end - start > MAX_LINE_PREVIEW;
+    const readEnd = truncated ? start + MAX_LINE_PREVIEW : end;
+    ensureActive(message.runId);
+    const bytes = await readRange(file, start, readEnd);
+    post({
+      type: "line",
+      runId: message.runId,
+      line: message.line,
+      start,
+      end,
+      text: decodeText(bytes),
+      truncated,
+    });
+    ensureActive(message.runId);
+    post({ type: "done", runId: message.runId, kind: "line" });
+  } catch (error) {
+    if (error.name === "CancelledError" || activeRunId !== message.runId) {
+      post({ type: "cancelled", runId: message.runId, kind: "line" });
+      return;
+    }
+    post({
+      type: "error",
+      runId: message.runId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    if (activeRunId === message.runId) {
+      activeRunId = null;
+    }
+  }
+}
+
+function retainLineIndex(index, fileId) {
+  if (lineIndex) {
+    lineIndex.free();
+  }
+  lineIndex = index;
+  lineIndexFileId = fileId;
+}
+
+function dropLineIndex() {
+  if (lineIndex) {
+    lineIndex.free();
+  }
+  lineIndex = null;
+  lineIndexFileId = null;
+}
+
+function patternBytes(pattern) {
+  if (typeof pattern !== "string" || pattern.length === 0) {
+    throw new Error("Enter a search pattern.");
+  }
+  const bytes = new TextEncoder().encode(pattern);
+  if (bytes.length < 1 || bytes.length > MAX_PATTERN_BYTES) {
+    throw new Error(`Search pattern must be between 1 and ${MAX_PATTERN_BYTES} bytes.`);
+  }
+  return bytes;
+}
+
+function decodeText(bytes) {
+  return new TextDecoder("utf-8", { fatal: false }).decode(bytes);
+}
+
+async function readRange(file, start, end) {
+  const buffer = await file.slice(start, end).arrayBuffer();
+  const bytes = new Uint8Array(buffer);
+  if (bytes.length !== end - start) {
+    throw new Error(`Short read at byte ${start}.`);
+  }
+  return bytes;
+}
+
+function postStatsProgress(progress) {
+  postPassProgress({ ...progress, phase: "stats" });
+}
+
+function postPassProgress({ runId, phase, bytesProcessed, fileSize, runStarted, processMs }) {
   post({
     type: "progress",
     runId,
-    phase: "stats",
+    phase,
     bytesProcessed,
     fileSize,
     percent: fileSize === 0 ? 100 : (bytesProcessed / fileSize) * 100,
@@ -349,11 +589,16 @@ function readSummary(stats) {
   };
 }
 
-function requireFile(message) {
+function requireFileOnly(message) {
   const file = message.file;
   if (!file || typeof file.size !== "number" || typeof file.slice !== "function") {
     throw new Error("Choose a file before running.");
   }
+  return file;
+}
+
+function requireFile(message) {
+  const file = requireFileOnly(message);
   if (!ALLOWED_CHUNK_SIZES.has(message.chunkSize)) {
     throw new Error("Chunk size must be 1, 2, or 4 MiB.");
   }

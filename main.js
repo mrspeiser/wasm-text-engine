@@ -25,6 +25,15 @@ const dom = {
   comparison: document.querySelector("#comparison"),
   previewMeta: document.querySelector("#preview-meta"),
   previewText: document.querySelector("#preview-text"),
+  searchPattern: document.querySelector("#search-pattern"),
+  searchButton: document.querySelector("#search-button"),
+  searchMeta: document.querySelector("#search-meta"),
+  searchHits: document.querySelector("#search-hits"),
+  indexStatus: document.querySelector("#index-status"),
+  lineNumber: document.querySelector("#line-number"),
+  lineButton: document.querySelector("#line-button"),
+  lineMeta: document.querySelector("#line-meta"),
+  lineText: document.querySelector("#line-text"),
   summary: {
     bytes: document.querySelector("#summary-bytes"),
     scalars: document.querySelector("#summary-scalars"),
@@ -45,6 +54,9 @@ const state = {
   runId: 0,
   previewId: 0,
   results: new Map(),
+  fileId: 0,
+  lineIndexReady: false,
+  indexedLines: 0,
 };
 
 const ENGINE_ORDER = ["javascript", "wasm"];
@@ -89,6 +101,20 @@ dom.dropzone.addEventListener("drop", (event) => {
 
 dom.runButton.addEventListener("click", startRun);
 dom.summarizeButton.addEventListener("click", startSummary);
+dom.searchButton.addEventListener("click", startSearch);
+dom.lineButton.addEventListener("click", startLine);
+dom.searchPattern.addEventListener("input", renderControls);
+dom.searchPattern.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    startSearch();
+  }
+});
+dom.lineNumber.addEventListener("input", renderControls);
+dom.lineNumber.addEventListener("keydown", (event) => {
+  if (event.key === "Enter") {
+    startLine();
+  }
+});
 dom.cancelButton.addEventListener("click", () => {
   worker.postMessage({ type: "cancel", runId: state.runId });
   setRunStatus("Cancelling…");
@@ -144,27 +170,34 @@ function onWorkerMessage(event) {
       renderComparison(message.comparison);
       break;
     case "stats":
+      state.lineIndexReady = true;
+      state.indexedLines = message.summary.lineCount;
       renderSummary(message.summary);
+      renderIndexStatus();
+      break;
+    case "search":
+      renderSearch(message);
+      break;
+    case "line":
+      renderLine(message);
       break;
     case "done":
       state.running = false;
-      setRunStatus(message.kind === "stats" ? "Summary finished." : "Benchmark finished.");
+      setRunStatus(finishedLabel(message.kind));
       renderControls();
       break;
     case "cancelled":
       state.running = false;
-      setRunStatus(
-        message.kind === "stats"
-          ? "Summary cancelled."
-          : "Cancelled. Results from engines that finished are still listed.",
-      );
+      setRunStatus(cancelledLabel(message.kind));
       dom.progress.classList.remove("is-probe");
+      renderIndexStatus();
       renderControls();
       break;
     case "error":
       state.running = false;
       setRunStatus(message.message);
       dom.progress.classList.remove("is-probe");
+      renderIndexStatus();
       renderControls();
       break;
     default:
@@ -179,6 +212,9 @@ function selectFile(file) {
   }
 
   state.file = file;
+  state.fileId += 1;
+  state.lineIndexReady = false;
+  state.indexedLines = 0;
   state.results = new Map();
   dom.fileName.textContent = file.name;
   dom.fileSize.textContent = `${formatBytes(file.size)} (${formatInt(file.size)} bytes)`;
@@ -186,11 +222,15 @@ function selectFile(file) {
   dom.fileMeta.classList.remove("hidden");
   resetProgress();
   clearSummary();
+  clearSearch();
+  clearLine();
+  renderIndexStatus();
   setRunStatus("Ready to run.");
   renderResults();
   clearComparison();
   requestPreview(file);
   renderControls();
+  worker.postMessage({ type: "drop-index" });
 }
 
 function requestPreview(file) {
@@ -238,15 +278,70 @@ function startSummary() {
   state.running = true;
   state.runId += 1;
   clearSummary();
+  dom.indexStatus.textContent = "Building a line index…";
   resetProgress();
   setRunStatus("Summarizing…");
   renderControls();
   worker.postMessage({
     type: "stats",
     runId: state.runId,
+    fileId: state.fileId,
     file: state.file,
     chunkSize: Number(dom.chunkSize.value),
   });
+}
+
+function startSearch() {
+  if (!state.file || state.running || !state.wasmReady || !searchPattern()) {
+    return;
+  }
+
+  state.running = true;
+  state.runId += 1;
+  clearSearch();
+  resetProgress();
+  setRunStatus("Searching…");
+  renderControls();
+  worker.postMessage({
+    type: "search",
+    runId: state.runId,
+    fileId: state.fileId,
+    file: state.file,
+    chunkSize: Number(dom.chunkSize.value),
+    pattern: dom.searchPattern.value,
+  });
+}
+
+function startLine() {
+  const line = selectedLine();
+  if (!state.file || state.running || !state.wasmReady || !state.lineIndexReady || line == null) {
+    return;
+  }
+
+  state.running = true;
+  state.runId += 1;
+  clearLine();
+  setRunStatus("Reading line…");
+  renderControls();
+  worker.postMessage({
+    type: "line",
+    runId: state.runId,
+    fileId: state.fileId,
+    file: state.file,
+    line,
+  });
+}
+
+function searchPattern() {
+  return dom.searchPattern.value.length > 0 ? dom.searchPattern.value : "";
+}
+
+function selectedLine() {
+  const value = Number(dom.lineNumber.value);
+  if (!Number.isSafeInteger(value) || value < 1) {
+    return null;
+  }
+  return value;
 }
 
 function selectedEngine() {
@@ -268,6 +363,11 @@ function renderControls() {
   const locked = state.running;
   dom.runButton.disabled = !canRun();
   dom.summarizeButton.disabled = locked || !state.file || !state.wasmReady;
+  dom.searchButton.disabled = locked || !state.file || !state.wasmReady || !searchPattern();
+  dom.lineButton.disabled =
+    locked || !state.file || !state.wasmReady || !state.lineIndexReady || selectedLine() == null;
+  dom.searchPattern.disabled = locked;
+  dom.lineNumber.disabled = locked;
   dom.cancelButton.disabled = !locked;
   dom.chooseFile.disabled = locked;
   dom.fileInput.disabled = locked;
@@ -297,6 +397,22 @@ function renderProgress(progress) {
     dom.statPercent.textContent = formatPercent(percent);
     dom.statElapsed.textContent = formatMs(progress.runElapsedMs);
     dom.statThroughput.textContent = formatThroughput(progress.processThroughputMibS);
+    return;
+  }
+
+  if (progress.phase === "search") {
+    setRunStatus("Searching…");
+    dom.statBytes.textContent = `${formatBytes(progress.bytesProcessed)} / ${formatBytes(progress.fileSize)}`;
+    dom.statPercent.textContent = formatPercent(percent);
+    dom.statElapsed.textContent = formatMs(progress.runElapsedMs);
+    dom.statThroughput.textContent = formatThroughput(progress.processThroughputMibS);
+    return;
+  }
+
+  if (progress.phase === "search-windows") {
+    setRunStatus("Reading match windows…");
+    dom.statPercent.textContent = formatPercent(percent);
+    dom.statElapsed.textContent = formatMs(progress.runElapsedMs);
     return;
   }
 
@@ -443,6 +559,89 @@ function clearSummary() {
   for (const node of Object.values(dom.summary)) {
     node.textContent = "—";
   }
+}
+
+function renderSearch(message) {
+  const shown = message.hits.length;
+  if (message.matchCount === 0) {
+    dom.searchMeta.textContent = "No matches.";
+  } else if (shown < message.matchCount) {
+    dom.searchMeta.textContent = `${formatInt(message.matchCount)} matches. Showing the first ${formatInt(shown)}.`;
+  } else {
+    dom.searchMeta.textContent = `${formatInt(message.matchCount)} ${message.matchCount === 1 ? "match" : "matches"}.`;
+  }
+
+  dom.searchHits.replaceChildren();
+  for (const hit of message.hits) {
+    const article = document.createElement("article");
+    article.className = "hit";
+    const title = document.createElement("p");
+    title.className = "hit-title";
+    title.textContent = `Line ${formatInt(hit.line)} · offset ${formatInt(hit.offset)}`;
+    const sample = document.createElement("pre");
+    sample.className = "preview hit-window";
+    const before = document.createElement("span");
+    before.textContent = hit.before;
+    const mark = document.createElement("mark");
+    mark.textContent = hit.match;
+    const after = document.createElement("span");
+    after.textContent = hit.after;
+    sample.append(before, mark, after);
+    article.append(title, sample);
+    dom.searchHits.append(article);
+  }
+}
+
+function clearSearch() {
+  dom.searchMeta.textContent = "";
+  dom.searchHits.replaceChildren();
+}
+
+function renderLine(message) {
+  const length = message.end - message.start;
+  dom.lineMeta.textContent = message.truncated
+    ? `Line ${formatInt(message.line)} is ${formatInt(length)} bytes. Showing the first ${formatBytes(8 * 1024)}.`
+    : `Line ${formatInt(message.line)}, bytes ${formatInt(message.start)}–${formatInt(message.end)}.`;
+  dom.lineText.textContent = message.text.length > 0 ? message.text : "(empty line)";
+  dom.lineText.classList.remove("hidden");
+}
+
+function clearLine() {
+  dom.lineMeta.textContent = "";
+  dom.lineText.textContent = "";
+  dom.lineText.classList.add("hidden");
+}
+
+function renderIndexStatus() {
+  dom.indexStatus.textContent = state.lineIndexReady
+    ? `Indexed ${formatInt(state.indexedLines)} ${state.indexedLines === 1 ? "line" : "lines"}.`
+    : "No line index yet. Summarize the file to build one.";
+}
+
+function finishedLabel(kind) {
+  if (kind === "stats") {
+    return "Summary finished.";
+  }
+  if (kind === "search") {
+    return "Search finished.";
+  }
+  if (kind === "line") {
+    return "Line loaded.";
+  }
+  return "Benchmark finished.";
+}
+
+function cancelledLabel(kind) {
+  if (kind === "stats") {
+    return "Summary cancelled.";
+  }
+  if (kind === "search") {
+    return "Search cancelled.";
+  }
+  if (kind === "line") {
+    return "Line jump cancelled.";
+  }
+  return "Cancelled. Results from engines that finished are still listed.";
 }
 
 function resetProgress() {
