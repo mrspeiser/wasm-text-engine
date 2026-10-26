@@ -17,6 +17,7 @@
  */
 
 import { countNewlines } from "./count-newlines.js";
+import { splitWindowLines } from "./split-window.js";
 
 const MIB = 1024 * 1024;
 const ALLOWED_CHUNK_SIZES = new Set([1 * MIB, 2 * MIB, 4 * MIB]);
@@ -26,6 +27,8 @@ const PROGRESS_INTERVAL_MS = 100;
 const MAX_PATTERN_BYTES = 1024;
 const CONTEXT_BYTES = 48;
 const MAX_LINE_PREVIEW = 8 * 1024;
+const WINDOW_LINES = 40;
+const WINDOW_BYTE_CAP = 256 * 1024;
 
 let wasmReady = null;
 let activeRunId = null;
@@ -161,6 +164,12 @@ self.onmessage = (event) => {
     return;
   }
 
+  if (message.type === "window") {
+    activeRunId = message.runId;
+    enqueue(() => handleWindow(message));
+    return;
+  }
+
   if (message.type === "drop-index") {
     enqueue(() => {
       dropLineIndex();
@@ -198,7 +207,9 @@ async function handleBenchmark(message) {
   try {
     const { file, engines, chunkSize, iterations } = validate(message);
     ensureActive(message.runId);
-    const wasm = engines.includes("wasm") ? await wasmReady : null;
+    const wasm = engines.some((engine) => engine === "wasm" || engine === "words")
+      ? await wasmReady
+      : null;
     ensureActive(message.runId);
     const runStarted = performance.now();
 
@@ -220,7 +231,7 @@ async function handleBenchmark(message) {
       });
 
       let transfer = null;
-      if (engine === "wasm") {
+      if (engine === "wasm" || engine === "words") {
         try {
           post({
             type: "progress",
@@ -519,6 +530,84 @@ async function handleLine(message) {
   }
 }
 
+async function handleWindow(message) {
+  try {
+    const file = requireFileOnly(message);
+    ensureActive(message.runId);
+    if (!lineIndex || message.fileId !== lineIndexFileId) {
+      throw new Error("Summarize this file before opening the viewer.");
+    }
+    const fileLineCount = toSafeNumber(lineIndex.line_count(), "Line count");
+    if (fileLineCount === 0) {
+      post({
+        type: "window",
+        runId: message.runId,
+        firstLine: 1,
+        fileLineCount: 0,
+        lines: [],
+        capped: false,
+        targetLine: null,
+      });
+      ensureActive(message.runId);
+      post({ type: "done", runId: message.runId, kind: "window" });
+      return;
+    }
+    if (!Number.isSafeInteger(message.firstLine) || message.firstLine < 1 || message.firstLine > fileLineCount) {
+      throw new Error(
+        `Line ${message.firstLine} is past the end of the file (${fileLineCount} lines).`,
+      );
+    }
+    const requested = Number.isSafeInteger(message.lineCount) && message.lineCount > 0
+      ? Math.min(message.lineCount, WINDOW_LINES)
+      : WINDOW_LINES;
+    const lastLine = Math.min(fileLineCount, message.firstLine + requested - 1);
+    const start = toSafeNumber(lineIndex.line_start(BigInt(message.firstLine)), "Line start");
+    const end = toSafeNumber(lineIndex.line_end(BigInt(lastLine)), "Line end");
+    if (end < start || start > file.size || end > file.size) {
+      throw new Error("The line index points outside the file.");
+    }
+    const capped = end - start > WINDOW_BYTE_CAP;
+    const readEnd = capped ? start + WINDOW_BYTE_CAP : end;
+    ensureActive(message.runId);
+    const bytes = await readRange(file, start, readEnd);
+    const split = splitWindowLines(bytes, { capped, maxLineBytes: MAX_LINE_PREVIEW });
+    const lines = split.map((line, index) => ({
+      line: message.firstLine + index,
+      text: line.text,
+      truncated: line.truncated,
+    }));
+    const expected = lastLine - message.firstLine + 1;
+    if (lines.length > expected || (!capped && lines.length !== expected)) {
+      throw new Error(`Viewer split ${lines.length} lines, but the index covers ${expected}.`);
+    }
+    post({
+      type: "window",
+      runId: message.runId,
+      firstLine: message.firstLine,
+      fileLineCount,
+      lines,
+      capped,
+      targetLine: Number.isSafeInteger(message.targetLine) ? message.targetLine : null,
+    });
+    ensureActive(message.runId);
+    post({ type: "done", runId: message.runId, kind: "window" });
+  } catch (error) {
+    if (error.name === "CancelledError" || activeRunId !== message.runId) {
+      post({ type: "cancelled", runId: message.runId, kind: "window" });
+      return;
+    }
+    post({
+      type: "error",
+      runId: message.runId,
+      message: error instanceof Error ? error.message : String(error),
+    });
+  } finally {
+    if (activeRunId === message.runId) {
+      activeRunId = null;
+    }
+  }
+}
+
 function retainLineIndex(index, fileId) {
   if (lineIndex) {
     lineIndex.free();
@@ -609,11 +698,13 @@ function validate(message) {
   const { file, chunkSize } = requireFile(message);
 
   const engines = message.engines;
-  if (!Array.isArray(engines) || engines.length < 1 || engines.length > 2) {
-    throw new Error("Choose JavaScript, WebAssembly, or both.");
+  if (!Array.isArray(engines) || engines.length < 1 || engines.length > 3) {
+    throw new Error("Choose JavaScript, a Rust scan, or several of them.");
   }
   const unique = new Set(engines);
-  const known = [...unique].every((engine) => engine === "javascript" || engine === "wasm");
+  const known = [...unique].every(
+    (engine) => engine === "javascript" || engine === "wasm" || engine === "words",
+  );
   if (unique.size !== engines.length || !known) {
     throw new Error("Unknown engine selection.");
   }
@@ -633,6 +724,15 @@ function warmup(wasm, engines) {
   }
   if (engines.includes("wasm")) {
     const processor = new wasm.WasmProcessor();
+    try {
+      processor.append_chunk(sample);
+      wasm.probe_transfer(sample);
+    } finally {
+      processor.free();
+    }
+  }
+  if (engines.includes("words")) {
+    const processor = new wasm.WasmWordProcessor();
     try {
       processor.append_chunk(sample);
       wasm.probe_transfer(sample);
@@ -674,7 +774,7 @@ async function collectSamples({
     let bytesProcessed = 0;
     let jsCount = 0;
     let lastProgress = 0;
-    const processor = engine === "wasm" ? new wasm.WasmProcessor() : null;
+    const processor = createProcessor(wasm, engine);
 
     try {
       for (let offset = 0; offset < file.size; offset += chunkSize) {
@@ -731,10 +831,12 @@ async function collectSamples({
         });
       }
 
-      const newlineCount =
-        engine === "wasm" ? toSafeNumber(processor.newline_count(), "Newline count") : jsCount;
-      const bytesSeen =
-        engine === "wasm" ? toSafeNumber(processor.bytes_seen(), "Bytes seen") : bytesProcessed;
+      const newlineCount = processor
+        ? toSafeNumber(processor.newline_count(), "Newline count")
+        : jsCount;
+      const bytesSeen = processor
+        ? toSafeNumber(processor.bytes_seen(), "Bytes seen")
+        : bytesProcessed;
 
       if (bytesSeen !== file.size) {
         throw new Error(`Processed ${bytesSeen} bytes, but the file is ${file.size} bytes.`);
@@ -876,28 +978,49 @@ function summarize({ engine, file, chunkSize, samples, transfer }) {
   };
 }
 
+function createProcessor(wasm, engine) {
+  if (engine === "wasm") {
+    return new wasm.WasmProcessor();
+  }
+  if (engine === "words") {
+    return new wasm.WasmWordProcessor();
+  }
+  return null;
+}
+
 function postComparison(runId, results, fileSize) {
   const javascript = results.find((result) => result.engine === "javascript");
   const wasm = results.find((result) => result.engine === "wasm");
-  if (!javascript || !wasm || typeof fileSize !== "number") {
+  const words = results.find((result) => result.engine === "words");
+  if (results.length < 2 || typeof fileSize !== "number") {
     return;
   }
+
+  const countsMatch = results.every(
+    (result) => result.newlineCount === results[0].newlineCount && result.bytesSeen === fileSize,
+  );
 
   post({
     type: "comparison",
     runId,
     comparison: {
-      countsMatch:
-        javascript.newlineCount === wasm.newlineCount &&
-        javascript.bytesSeen === wasm.bytesSeen &&
-        javascript.bytesSeen === fileSize,
-      javascriptNewlines: javascript.newlineCount,
-      wasmNewlines: wasm.newlineCount,
-      endToEnd: ratio(wasm.totalMs.median, javascript.totalMs.median),
-      callVsScan: ratio(wasm.processMs.median, javascript.processMs.median),
-      estimatedScanVsJs: ratio(wasm.transfer?.estimatedScanMs, javascript.processMs.median),
-      estimatedScanMs: wasm.transfer?.estimatedScanMs ?? null,
-      jsProcessMs: javascript.processMs.median,
+      countsMatch,
+      javascriptNewlines: javascript?.newlineCount ?? null,
+      wasmNewlines: wasm?.newlineCount ?? null,
+      wordsNewlines: words?.newlineCount ?? null,
+      endToEnd: javascript && wasm ? ratio(wasm.totalMs.median, javascript.totalMs.median) : null,
+      callVsScan: javascript && wasm ? ratio(wasm.processMs.median, javascript.processMs.median) : null,
+      estimatedScanVsJs:
+        javascript && wasm ? ratio(wasm.transfer?.estimatedScanMs, javascript.processMs.median) : null,
+      estimatedScanMs: wasm?.transfer?.estimatedScanMs ?? null,
+      jsProcessMs: javascript?.processMs.median ?? null,
+      wordsVsWasmCall: words && wasm ? ratio(words.processMs.median, wasm.processMs.median) : null,
+      wordsVsWasmScan:
+        words && wasm
+          ? ratio(words.transfer?.estimatedScanMs, wasm.transfer?.estimatedScanMs)
+          : null,
+      wordsProcessMs: words?.processMs.median ?? null,
+      wasmProcessMs: wasm?.processMs.median ?? null,
     },
   });
 }

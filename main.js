@@ -34,6 +34,11 @@ const dom = {
   lineButton: document.querySelector("#line-button"),
   lineMeta: document.querySelector("#line-meta"),
   lineText: document.querySelector("#line-text"),
+  viewerPrev: document.querySelector("#viewer-prev"),
+  viewerNext: document.querySelector("#viewer-next"),
+  viewerScroll: document.querySelector("#viewer-scroll"),
+  viewerMeta: document.querySelector("#viewer-meta"),
+  viewerLines: document.querySelector("#viewer-lines"),
   summary: {
     bytes: document.querySelector("#summary-bytes"),
     scalars: document.querySelector("#summary-scalars"),
@@ -57,12 +62,21 @@ const state = {
   fileId: 0,
   lineIndexReady: false,
   indexedLines: 0,
+  viewerJump: null,
+  viewerTarget: null,
+  viewer: {
+    firstLine: 1,
+    lines: [],
+    capped: false,
+  },
 };
 
-const ENGINE_ORDER = ["javascript", "wasm"];
+const WINDOW_LINES = 40;
+const ENGINE_ORDER = ["javascript", "wasm", "words"];
 const ENGINE_LABELS = {
   javascript: "JavaScript",
-  wasm: "Rust / WebAssembly",
+  wasm: "Rust, one byte at a time",
+  words: "Rust, 8 bytes at a time",
 };
 
 worker.addEventListener("message", onWorkerMessage);
@@ -113,6 +127,14 @@ dom.lineNumber.addEventListener("input", renderControls);
 dom.lineNumber.addEventListener("keydown", (event) => {
   if (event.key === "Enter") {
     startLine();
+  }
+});
+dom.viewerPrev.addEventListener("click", () => pageViewer(-1));
+dom.viewerNext.addEventListener("click", () => pageViewer(1));
+dom.viewerScroll.addEventListener("change", () => {
+  const line = Number(dom.viewerScroll.value);
+  if (Number.isSafeInteger(line)) {
+    showWindow(line, line);
   }
 });
 dom.cancelButton.addEventListener("click", () => {
@@ -181,13 +203,24 @@ function onWorkerMessage(event) {
     case "line":
       renderLine(message);
       break;
+    case "window":
+      renderWindow(message);
+      break;
     case "done":
       state.running = false;
       setRunStatus(finishedLabel(message.kind));
       renderControls();
+      if (message.kind === "stats" && state.lineIndexReady && state.indexedLines > 0) {
+        showWindow(1, null);
+      } else if (message.kind === "line" && state.viewerJump != null) {
+        const line = state.viewerJump;
+        state.viewerJump = null;
+        showWindow(line, line);
+      }
       break;
     case "cancelled":
       state.running = false;
+      state.viewerJump = null;
       setRunStatus(cancelledLabel(message.kind));
       dom.progress.classList.remove("is-probe");
       renderIndexStatus();
@@ -195,6 +228,7 @@ function onWorkerMessage(event) {
       break;
     case "error":
       state.running = false;
+      state.viewerJump = null;
       setRunStatus(message.message);
       dom.progress.classList.remove("is-probe");
       renderIndexStatus();
@@ -224,6 +258,7 @@ function selectFile(file) {
   clearSummary();
   clearSearch();
   clearLine();
+  clearViewer();
   renderIndexStatus();
   setRunStatus("Ready to run.");
   renderResults();
@@ -258,8 +293,7 @@ function startRun() {
   setRunStatus("Starting…");
   renderControls();
 
-  const engine = selectedEngine();
-  const engines = engine === "both" ? ["javascript", "wasm"] : [engine];
+  const engines = selectedEngines();
   worker.postMessage({
     type: "benchmark",
     runId: state.runId,
@@ -320,6 +354,7 @@ function startLine() {
 
   state.running = true;
   state.runId += 1;
+  state.viewerJump = line;
   clearLine();
   setRunStatus("Reading line…");
   renderControls();
@@ -348,12 +383,23 @@ function selectedEngine() {
   return document.querySelector('input[name="engine"]:checked')?.value ?? "both";
 }
 
+function selectedEngines() {
+  const engine = selectedEngine();
+  if (engine === "both") {
+    return ["javascript", "wasm"];
+  }
+  if (engine === "all") {
+    return ["javascript", "wasm", "words"];
+  }
+  return [engine];
+}
+
 function canRun() {
   if (!state.file || state.running) {
     return false;
   }
-  const engine = selectedEngine();
-  if ((engine === "wasm" || engine === "both") && !state.wasmReady) {
+  const engines = selectedEngines();
+  if (engines.some((engine) => engine === "wasm" || engine === "words") && !state.wasmReady) {
     return false;
   }
   return true;
@@ -368,6 +414,12 @@ function renderControls() {
     locked || !state.file || !state.wasmReady || !state.lineIndexReady || selectedLine() == null;
   dom.searchPattern.disabled = locked;
   dom.lineNumber.disabled = locked;
+  dom.viewerPrev.disabled = locked || !canPageViewer(-1);
+  dom.viewerNext.disabled = locked || !canPageViewer(1);
+  dom.viewerScroll.disabled = locked || !state.lineIndexReady || state.indexedLines < 1;
+  for (const button of document.querySelectorAll(".hit-jump")) {
+    button.disabled = locked;
+  }
   dom.cancelButton.disabled = !locked;
   dom.chooseFile.disabled = locked;
   dom.fileInput.disabled = locked;
@@ -449,8 +501,9 @@ function renderCard(engine, result) {
   }
 
   const list = document.createElement("dl");
-  const processLabel = engine === "wasm" ? "Call time (copy + scan)" : "Scan time";
-  const throughputLabel = engine === "wasm" ? "Call throughput" : "Scan throughput";
+  const wasmCall = engine === "wasm" || engine === "words";
+  const processLabel = wasmCall ? "Call time (copy + scan)" : "Scan time";
+  const throughputLabel = wasmCall ? "Call throughput" : "Scan throughput";
   const rows = [
     ["Newline count", formatInt(result.newlineCount)],
     ["Bytes seen", formatInt(result.bytesSeen)],
@@ -510,29 +563,67 @@ function renderComparison(comparison) {
   const banner = document.createElement("p");
   banner.className = comparison.countsMatch ? "banner ok" : "banner error";
   banner.textContent = comparison.countsMatch
-    ? `Counts match: ${formatInt(comparison.javascriptNewlines)} newlines.`
-    : `Counts differ. JavaScript found ${formatInt(comparison.javascriptNewlines)} newlines; Rust/WebAssembly found ${formatInt(comparison.wasmNewlines)}. This comparison is not valid.`;
+    ? `Counts match: ${formatInt(shownNewlineCount(comparison))} newlines.`
+    : countMismatch(comparison);
   dom.comparison.append(banner);
 
   const list = document.createElement("ul");
-  list.append(
-    item(`${timesAsLong("The Rust/WebAssembly run", "the JavaScript run", comparison.endToEnd)} This is end-to-end time, including file reads.`),
-    item(callComparison(comparison)),
-    item(scanComparison(comparison)),
-  );
+  if (comparison.javascriptNewlines != null && comparison.wasmNewlines != null) {
+    list.append(
+      item(`${timesAsLong("The one-byte Rust run", "the JavaScript run", comparison.endToEnd)} This is end-to-end time, including file reads.`),
+      item(callComparison(comparison)),
+      item(scanComparison(comparison)),
+    );
+  }
+  if (comparison.wordsNewlines != null && comparison.wasmNewlines != null) {
+    list.append(
+      item(`${timesAsLong("The 8-byte Rust call", "the one-byte Rust call", comparison.wordsVsWasmCall)} Both calls include the copy into WebAssembly memory.`),
+      item(wordsScanComparison(comparison)),
+    );
+  }
   dom.comparison.append(list);
 
   const cache = document.createElement("p");
   cache.className = "hint";
-  cache.textContent = "JavaScript runs first. WebAssembly may then read a warmer file cache, so a lower end-to-end time is not by itself evidence of a faster scan.";
+  cache.textContent = comparison.wordsNewlines == null
+    ? "JavaScript runs first. The one-byte Rust scan may then read a warmer file cache, so a lower end-to-end time is not by itself evidence of a faster scan."
+    : "JavaScript runs first, then the one-byte Rust scan, then the 8-byte scan. Later reads may see a warmer file cache, so a lower end-to-end time is not by itself evidence of a faster scan.";
   dom.comparison.append(cache);
+}
+
+function shownNewlineCount(comparison) {
+  return comparison.javascriptNewlines ?? comparison.wasmNewlines ?? comparison.wordsNewlines;
+}
+
+function countMismatch(comparison) {
+  const parts = [];
+  if (comparison.javascriptNewlines != null) {
+    parts.push(`JavaScript found ${formatInt(comparison.javascriptNewlines)}`);
+  }
+  if (comparison.wasmNewlines != null) {
+    parts.push(`the one-byte Rust scan found ${formatInt(comparison.wasmNewlines)}`);
+  }
+  if (comparison.wordsNewlines != null) {
+    parts.push(`the 8-byte Rust scan found ${formatInt(comparison.wordsNewlines)}`);
+  }
+  return `Counts differ. ${parts.join("; ")}. This comparison is not valid.`;
+}
+
+function wordsScanComparison(comparison) {
+  if (comparison.wordsVsWasmScan != null) {
+    return `${timesAsLong("The estimated 8-byte scan", "the estimated one-byte scan", comparison.wordsVsWasmScan)} Both estimates subtract the transfer sample from the call time.`;
+  }
+  if (!(comparison.wordsProcessMs > 0) || !(comparison.wasmProcessMs > 0)) {
+    return "A call timer read zero, so the estimated 8-byte scan cannot be compared with the estimated one-byte scan.";
+  }
+  return "Estimated scan time is unavailable for one of the Rust calls. The transfer estimate was at least as large as that call, so the difference is inside the noise of the sample.";
 }
 
 function clearComparison() {
   dom.comparison.replaceChildren();
   const note = document.createElement("p");
   note.className = "muted";
-  note.textContent = "Run both engines to compare them on the same file.";
+  note.textContent = "Run two or more engines to compare them on the same file.";
   dom.comparison.append(note);
 }
 
@@ -575,9 +666,17 @@ function renderSearch(message) {
   for (const hit of message.hits) {
     const article = document.createElement("article");
     article.className = "hit";
-    const title = document.createElement("p");
-    title.className = "hit-title";
+    const title = document.createElement("button");
+    title.type = "button";
+    title.className = "hit-jump";
     title.textContent = `Line ${formatInt(hit.line)} · offset ${formatInt(hit.offset)}`;
+    title.addEventListener("click", () => {
+      if (!state.lineIndexReady) {
+        setRunStatus("Summarize this file before opening the viewer.");
+        return;
+      }
+      showWindow(hit.line, hit.line);
+    });
     const sample = document.createElement("pre");
     sample.className = "preview hit-window";
     const before = document.createElement("span");
@@ -590,6 +689,7 @@ function renderSearch(message) {
     article.append(title, sample);
     dom.searchHits.append(article);
   }
+  renderControls();
 }
 
 function clearSearch() {
@@ -618,6 +718,113 @@ function renderIndexStatus() {
     : "No line index yet. Summarize the file to build one.";
 }
 
+function showWindow(firstLine, targetLine) {
+  if (!state.file || state.running || !state.wasmReady || !state.lineIndexReady) {
+    return;
+  }
+  if (state.indexedLines < 1) {
+    clearViewer();
+    dom.viewerMeta.textContent = "This file has no lines.";
+    return;
+  }
+  const start = Math.min(Math.max(1, firstLine), state.indexedLines);
+  state.viewerTarget = targetLine;
+  state.running = true;
+  state.runId += 1;
+  setRunStatus("Reading lines…");
+  renderControls();
+  worker.postMessage({
+    type: "window",
+    runId: state.runId,
+    fileId: state.fileId,
+    file: state.file,
+    firstLine: start,
+    lineCount: WINDOW_LINES,
+    targetLine,
+  });
+}
+
+function pageViewer(direction) {
+  if (!canPageViewer(direction)) {
+    return;
+  }
+  if (direction < 0) {
+    showWindow(state.viewer.firstLine - WINDOW_LINES, state.viewerTarget);
+    return;
+  }
+  const last = state.viewer.lines[state.viewer.lines.length - 1].line;
+  showWindow(last + 1, state.viewerTarget);
+}
+
+function canPageViewer(direction) {
+  if (!state.lineIndexReady || state.indexedLines < 1 || state.viewer.lines.length === 0) {
+    return false;
+  }
+  if (direction < 0) {
+    return state.viewer.firstLine > 1;
+  }
+  const last = state.viewer.lines[state.viewer.lines.length - 1].line;
+  return last < state.indexedLines;
+}
+
+function renderWindow(message) {
+  state.viewer = {
+    firstLine: message.firstLine,
+    lines: message.lines,
+    capped: message.capped,
+  };
+  state.viewerTarget = message.targetLine;
+  dom.viewerLines.replaceChildren();
+  if (message.fileLineCount === 0 || message.lines.length === 0) {
+    dom.viewerMeta.textContent = "This file has no lines.";
+    dom.viewerScroll.min = "1";
+    dom.viewerScroll.max = "1";
+    dom.viewerScroll.value = "1";
+    return;
+  }
+
+  const last = message.lines[message.lines.length - 1].line;
+  dom.viewerMeta.textContent = message.capped
+    ? `Lines ${formatInt(message.firstLine)}–${formatInt(last)} of ${formatInt(message.fileLineCount)}. This page was cut at 256 KiB.`
+    : `Lines ${formatInt(message.firstLine)}–${formatInt(last)} of ${formatInt(message.fileLineCount)}.`;
+  dom.viewerScroll.min = "1";
+  dom.viewerScroll.max = String(message.fileLineCount);
+  dom.viewerScroll.value = String(message.firstLine);
+
+  for (const line of message.lines) {
+    const row = document.createElement("div");
+    row.className = "viewer-row";
+    if (line.line === message.targetLine) {
+      row.classList.add("is-target");
+    }
+    const number = document.createElement("span");
+    number.className = "viewer-number";
+    number.textContent = formatInt(line.line);
+    const text = document.createElement("span");
+    text.className = "viewer-text";
+    text.textContent = line.text.length > 0 ? line.text : "";
+    if (line.truncated) {
+      const note = document.createElement("span");
+      note.className = "viewer-cut";
+      note.textContent = " …";
+      text.append(note);
+    }
+    row.append(number, text);
+    dom.viewerLines.append(row);
+  }
+}
+
+function clearViewer() {
+  state.viewerJump = null;
+  state.viewerTarget = null;
+  state.viewer = { firstLine: 1, lines: [], capped: false };
+  dom.viewerMeta.textContent = "Summarize the file to open the viewer.";
+  dom.viewerLines.replaceChildren();
+  dom.viewerScroll.min = "1";
+  dom.viewerScroll.max = "1";
+  dom.viewerScroll.value = "1";
+}
+
 function finishedLabel(kind) {
   if (kind === "stats") {
     return "Summary finished.";
@@ -627,6 +834,9 @@ function finishedLabel(kind) {
   }
   if (kind === "line") {
     return "Line loaded.";
+  }
+  if (kind === "window") {
+    return "Viewer updated.";
   }
   return "Benchmark finished.";
 }
@@ -640,6 +850,9 @@ function cancelledLabel(kind) {
   }
   if (kind === "line") {
     return "Line jump cancelled.";
+  }
+  if (kind === "window") {
+    return "Viewer cancelled.";
   }
   return "Cancelled. Results from engines that finished are still listed.";
 }
@@ -682,22 +895,22 @@ function item(text) {
 
 function callComparison(comparison) {
   if (comparison.callVsScan == null) {
-    return "The Wasm call could not be compared with the JavaScript scan because a timer read zero. The call still includes the copy into WebAssembly memory.";
+    return "The one-byte Rust call could not be compared with the JavaScript scan because a timer read zero. The call still includes the copy into WebAssembly memory.";
   }
-  return `${timesAsLong("The Wasm call", "the JavaScript scan", comparison.callVsScan)} The call includes the copy into WebAssembly memory.`;
+  return `${timesAsLong("The one-byte Rust call", "the JavaScript scan", comparison.callVsScan)} The call includes the copy into WebAssembly memory.`;
 }
 
 function scanComparison(comparison) {
   if (comparison.estimatedScanVsJs != null) {
-    return `${timesAsLong("The estimated Wasm scan", "the JavaScript scan", comparison.estimatedScanVsJs)} This subtracts the transfer estimate from the call time.`;
+    return `${timesAsLong("The estimated one-byte Rust scan", "the JavaScript scan", comparison.estimatedScanVsJs)} This subtracts the transfer estimate from the call time.`;
   }
   if (!(comparison.jsProcessMs > 0)) {
     return "The JavaScript scan was below the timer resolution, so it cannot be compared with the estimated Wasm scan.";
   }
   if (typeof comparison.estimatedScanMs !== "number") {
-    return "Estimated Wasm scan time is unavailable. The transfer estimate was at least as large as the call time, so the difference is inside the noise of the sample.";
+    return "Estimated one-byte Rust scan time is unavailable. The transfer estimate was at least as large as the call time, so the difference is inside the noise of the sample.";
   }
-  return "Estimated Wasm scan time could not be compared with the JavaScript scan.";
+  return "Estimated one-byte Rust scan time could not be compared with the JavaScript scan.";
 }
 
 function timesAsLong(subject, baseline, value) {

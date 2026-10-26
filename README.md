@@ -15,9 +15,9 @@ WebAssembly does not automatically make the scan faster. `wasm-bindgen` copies e
 ```text
 main thread                worker                         Rust / Wasm
 -----------                ------                         -----------
-file picker, drop zone     slice the File into chunks    TextProcessor
-progress and results       JavaScript newline loop       append_chunk(&[u8])
-64 KiB preview             WasmProcessor                 count of 0x0A
+file picker, drop zone     slice the File into chunks    TextProcessor, one byte
+progress and results       JavaScript newline loop       WordProcessor, 8 bytes
+64 KiB preview             both Wasm counters            count of 0x0A
 Summarize                  a separate stats pass         TextStats, LineIndex
 Search                     exact byte pattern           ByteSearch
 Go to line                 one slice of the file         newline offsets
@@ -25,7 +25,7 @@ Go to line                 one slice of the file         newline offsets
 
 The main thread sends the `File` with `postMessage`. Structured clone hands the worker a file handle; it does not copy the body. The worker reads `file.slice(start, end).arrayBuffer()` in 1, 2, or 4 MiB chunks, then drops the chunk after counting it.
 
-`TextProcessor` in [`src/processor.rs`](src/processor.rs) is ordinary Rust. It tracks `bytes_seen` and `newline_count` as `u64` values and can be reset. [`src/lib.rs`](src/lib.rs) is the `wasm-bindgen` adapter: `WasmProcessor` plus `probe_transfer`, a call that copies a chunk and returns its length so the benchmark can estimate transfer cost. [`TextStats`](src/stats.rs) is a second type for scalars, CRLF pairs, and line length. [`LineIndex`](src/index.rs) records the offset of each newline during that same pass. [`ByteSearch`](src/search.rs) finds an exact byte pattern and keeps the last `pattern.len() - 1` bytes so a match split across two chunks is counted once. The benchmark does not call any of them.
+`TextProcessor` in [`src/processor.rs`](src/processor.rs) is ordinary Rust. It tracks `bytes_seen` and `newline_count` as `u64` values and can be reset. [`WordProcessor`](src/words.rs) counts the same `0x0A` bytes eight at a time and must return the same total. [`src/lib.rs`](src/lib.rs) is the `wasm-bindgen` adapter: `WasmProcessor`, `WasmWordProcessor`, and `probe_transfer`, a call that copies a chunk and returns its length so the benchmark can estimate transfer cost. [`TextStats`](src/stats.rs) is a second type for scalars, CRLF pairs, and line length. [`LineIndex`](src/index.rs) records the offset of each newline during that same pass. [`ByteSearch`](src/search.rs) finds an exact byte pattern and keeps the last `pattern.len() - 1` bytes so a match split across two chunks is counted once. The benchmark does not call those three.
 
 A newline is one byte, so a chunk boundary cannot split one. Carriage return (`0x0D`) is not counted. Tests split buffers at every offset and check that the total matches a single pass.
 
@@ -95,13 +95,19 @@ The same pass builds a line index: one `u64` offset per `0x0A`. Go to line uses 
 
 Search is another separate pass. The pattern is the UTF-8 bytes of the text you type, compared exactly, so it is case-sensitive. The worker reads the file in the same 1, 2, or 4 MiB chunks. Rust keeps a tail shorter than the pattern and reports each match's file offset and 1-based line. The line is the one that contains the match's first byte, using the same newline rule as the statistics pass.
 
-The page shows the first 100 matches. Each one is a short window read from the file around that offset, not a copy of the line kept during the scan. Matches after the first 100 are still included in the count. A pattern can be at most 1024 bytes.
+The page shows the first 100 matches. Each one is a short window read from the file around that offset, not a copy of the line kept during the scan. Matches after the first 100 are still included in the count. A pattern can be at most 1024 bytes. Clicking a match opens that line in the viewer.
+
+## Viewer
+
+The viewer uses the line index from Summarize. It asks the worker for about 40 lines. Those lines are one byte range, from the start of the first line through the end of the last, read with a single `slice`. The page splits that slice on `0x0A`. A scrollbar and the page buttons move by line number. The scroll height is not the height of the whole file.
+
+A window is capped at 256 KiB. A single line shown in the viewer is capped at 8 KiB, the same limit as Go to line, and the row is marked when that happens.
 
 ## Tradeoffs
 
 - Chunked reads keep memory to about one chunk, plus the WebAssembly copy of that chunk. A multi-gigabyte file is not turned into a JavaScript string.
 - Smaller chunks make cancel and progress more responsive. They also make the per-call copy show up more in the Wasm call time. 4 MiB is the default.
-- The Rust scan is a scalar loop. It is the same algorithm as the JavaScript loop. SIMD is future work, not something this comparison claims.
+- The one-byte Rust scan is the same algorithm as the JavaScript loop. The 8-byte scan is a separate column and must report the same newline count. SIMD is future work.
 - `u64` counters are wide enough for multi-gigabyte input. Values that do not fit in `Number.MAX_SAFE_INTEGER` are rejected at the JavaScript boundary instead of being rounded. A real text file will not get there.
 - `append_chunk` returns an error if a total would overflow `u64`, and it leaves the previous totals in place. That path is for correctness, not for files a browser can open.
 - The transfer figure is an estimate from a sample. It is labeled that way. It is not subtracted from the published call time; the call time remains the direct measurement.
@@ -110,34 +116,35 @@ The page shows the first 100 matches. Each one is a short window read from the f
 ## Current features
 
 - Drag-and-drop and a file picker, with name, size, and type.
-- Chunked `0x0A` counts in JavaScript and Rust/WebAssembly.
+- Chunked `0x0A` counts in JavaScript, a one-byte Rust scan, and an 8-byte Rust scan. The counts must match.
 - Progress, elapsed time, processing throughput, and cancel.
 - Side-by-side medians, throughput, and a count check.
 - A UTF-8 preview of the first 64 KiB.
 - A separate statistics pass: scalars, invalid UTF-8 sequences, CRLF pairs, line count, and the longest line.
 - A newline offset index built by Summarize, and Go to line, which reads only that line.
 - Chunk-safe exact search, with file offset, line number, and a short window around each of the first 100 matches.
+- A windowed line viewer. Summarize builds the index, then the page reads about 40 lines at a time.
 - Host unit tests for the Rust counter and `node --test` for the JavaScript counter.
 
 ## Planned features
 
-- A virtualized line viewer that does not render the whole file.
 - Format-specific parsing and filtering for CSV, JSON, and logs.
-- A word-at-a-time newline scan, measured against this scalar baseline, then SIMD.
+- A SIMD newline scan, measured against the one-byte and 8-byte counts.
 
 ## Tests
 
 ```bash
 cargo test
-node --test count-newlines.test.js
+node --test count-newlines.test.js split-window.test.js
 ```
 
-`cargo test` runs on the host and does not need the browser package. The newline tests cover empty input, input without newlines, repeated newlines, a split at every offset, a newline on either side of a boundary, reset, many chunks, totals past `u32::MAX`, and overflow that does not change the previous totals. The statistics tests cover the same kind of split, plus a CRLF pair divided across two chunks, a partial UTF-8 character completed by the next chunk, and a truncated character closed by `finish()`. Search tests split the pattern at every offset, including a multi-byte character, and check overlapping matches. The line index tests check that its line count matches `TextStats` for the same bytes.
+`cargo test` runs on the host and does not need the browser package. The newline tests cover empty input, input without newlines, repeated newlines, a split at every offset, a newline on either side of a boundary, reset, many chunks, totals past `u32::MAX`, and overflow that does not change the previous totals. The 8-byte scan is checked against the one-byte count for every byte value in every lane, and for a split at every offset. The statistics tests cover the same kind of split, plus a CRLF pair divided across two chunks, a partial UTF-8 character completed by the next chunk, and a truncated character closed by `finish()`. Search tests split the pattern at every offset, including a multi-byte character, and check overlapping matches. The line index tests check that its line count matches `TextStats` for the same bytes. The viewer split tests check consecutive lines, a blank line, a final line with no newline, and a slice that starts after the first line.
 
 ## Layout
 
 ```text
-src/processor.rs          newline counter used by the benchmark
+src/processor.rs          one-byte newline counter used by the benchmark
+src/words.rs              eight-byte newline counter
 src/utf8.rs               one UTF-8 unit at a time
 src/stats.rs              streaming line and scalar totals
 src/index.rs              newline offsets for Go to line
@@ -148,6 +155,7 @@ main.js                   file picker, progress, and results
 worker.js                 chunked reads and both benchmarks
 styles.css                page styles
 count-newlines.js         JavaScript newline scan
+split-window.js           viewer slice split into lines
 web/index.html            redirect from /web/ to /
 scripts/generate_test_file.py
 pkg/                      generated by wasm-pack, not committed

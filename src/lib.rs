@@ -11,12 +11,14 @@ mod processor;
 mod search;
 mod stats;
 mod utf8;
+mod words;
 
 pub use index::{LineIndex, LineRange};
 pub use processor::{CounterOverflow, TextProcessor, count_newlines};
 pub use search::{ByteSearch, EmptyPattern, SearchHit, STORED_HIT_LIMIT};
 pub use stats::TextStats;
 pub use utf8::{DecodeStep, next_unit};
+pub use words::{WordProcessor, count_newlines_words};
 
 use wasm_bindgen::prelude::*;
 
@@ -40,6 +42,43 @@ impl WasmProcessor {
     /// The copy performed by `wasm-bindgen` happens before this method, so it
     /// is included in any JavaScript timing of the call. Throws if a total
     /// would exceed `u64::MAX`; the previous totals are kept.
+    pub fn append_chunk(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
+        self.inner
+            .append_chunk(chunk)
+            .map_err(|error| JsValue::from_str(&error.to_string()))
+    }
+
+    pub fn newline_count(&self) -> u64 {
+        self.inner.newline_count()
+    }
+
+    pub fn bytes_seen(&self) -> u64 {
+        self.inner.bytes_seen()
+    }
+
+    pub fn reset(&mut self) {
+        self.inner.reset();
+    }
+}
+
+/// Eight-byte newline counter exposed to JavaScript.
+///
+/// This is a separate benchmark column. [`WasmProcessor`] still counts one
+/// byte at a time.
+#[wasm_bindgen]
+pub struct WasmWordProcessor {
+    inner: WordProcessor,
+}
+
+#[wasm_bindgen]
+impl WasmWordProcessor {
+    #[wasm_bindgen(constructor)]
+    pub fn new() -> WasmWordProcessor {
+        WasmWordProcessor {
+            inner: WordProcessor::new(),
+        }
+    }
+
     pub fn append_chunk(&mut self, chunk: &[u8]) -> Result<(), JsValue> {
         self.inner
             .append_chunk(chunk)

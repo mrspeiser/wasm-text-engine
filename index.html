@@ -53,8 +53,10 @@
                     <fieldset>
                         <legend>Engine</legend>
                         <label><input type="radio" name="engine" value="javascript"> JavaScript</label>
-                        <label><input type="radio" name="engine" value="wasm"> Rust / WebAssembly</label>
+                        <label><input type="radio" name="engine" value="wasm"> Rust, one byte at a time</label>
+                        <label><input type="radio" name="engine" value="words"> Rust, 8 bytes at a time</label>
                         <label><input type="radio" name="engine" value="both" checked> Run both</label>
+                        <label><input type="radio" name="engine" value="all"> Run all</label>
                     </fieldset>
                     <label class="field">
                         Chunk size
@@ -78,7 +80,7 @@
                         <button type="button" id="cancel-button" class="ghost" disabled>Cancel</button>
                     </div>
                 </div>
-                <p class="hint">Each iteration reads the file again. Reported times are the median of those iterations. JavaScript runs before WebAssembly when both are selected.</p>
+                <p class="hint">Each iteration reads the file again. Reported times are the median of those iterations. JavaScript runs first, then the one-byte Rust scan, then the 8-byte Rust scan, when more than one is selected. The 8-byte scan must report the same newline count.</p>
             </section>
 
             <section class="panel" aria-labelledby="progress-heading">
@@ -119,7 +121,7 @@
                 <h2 id="results-heading">Results</h2>
                 <div id="results" class="results"></div>
                 <div id="comparison" class="comparison">
-                    <p class="muted">Run both engines to compare them on the same file.</p>
+                    <p class="muted">Run two or more engines to compare them on the same file.</p>
                 </div>
             </section>
 
@@ -183,6 +185,21 @@
                 <pre id="line-text" class="preview hidden"></pre>
             </section>
 
+            <section class="panel" aria-labelledby="viewer-heading">
+                <h2 id="viewer-heading">Viewer</h2>
+                <p class="hint">After Summarize, this shows 40 lines at a time. One slice covers the visible lines. The scrollbar moves by line number, not by a copy of the file.</p>
+                <div class="viewer-bar">
+                    <button type="button" id="viewer-prev" class="ghost" disabled>Page up</button>
+                    <button type="button" id="viewer-next" class="ghost" disabled>Page down</button>
+                    <label class="tool-field viewer-scroll">
+                        Line
+                        <input id="viewer-scroll" type="range" min="1" max="1" value="1" disabled>
+                    </label>
+                </div>
+                <p id="viewer-meta" class="hint">Summarize the file to open the viewer.</p>
+                <div id="viewer-lines" class="viewer"></div>
+            </section>
+
             <section class="panel" aria-labelledby="metrics-heading">
                 <h2 id="metrics-heading">What the numbers measure</h2>
                 <dl class="glossary">
@@ -216,7 +233,7 @@
                     </div>
                     <div>
                         <dt>Newline count</dt>
-                        <dd>Bytes equal to <code>0x0A</code>. Carriage returns are not counted. The count does not depend on chunk size. A mismatch means the comparison is invalid.</dd>
+                        <dd>Bytes equal to <code>0x0A</code>. Carriage returns are not counted. The one-byte Rust scan and the 8-byte Rust scan must agree with JavaScript. The count does not depend on chunk size. A mismatch means the comparison is invalid.</dd>
                     </div>
                 </dl>
             </section>

@@ -292,7 +292,7 @@ button:disabled {
 
 .results {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
     gap: 12px;
 }
 
@@ -311,6 +311,7 @@ button:disabled {
 
 .card.javascript h3 { color: var(--js); }
 .card.wasm h3 { color: var(--accent); }
+.card.words h3 { color: var(--ok); }
 
 .card dl {
     display: grid;
@@ -475,6 +476,78 @@ mark {
 #line-heading {
     margin: 22px 0 14px;
     font-size: 1.05rem;
+}
+
+.hit-jump {
+    justify-content: flex-start;
+    width: fit-content;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.82rem;
+    text-align: left;
+}
+
+.hit-jump:hover:not(:disabled) {
+    color: var(--text);
+}
+
+.viewer-bar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    align-items: end;
+}
+
+.viewer-scroll {
+    flex: 1 1 220px;
+}
+
+input[type="range"] {
+    width: 100%;
+    accent-color: var(--accent);
+}
+
+.viewer {
+    margin-top: 10px;
+    max-height: 28rem;
+    overflow: auto;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--bg-inset);
+}
+
+.viewer-row {
+    display: grid;
+    grid-template-columns: 5.5rem minmax(0, 1fr);
+    gap: 12px;
+    min-height: 1.45em;
+    padding: 0 12px;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 0.82rem;
+    line-height: 1.45;
+}
+
+.viewer-row.is-target {
+    background: rgba(226, 177, 90, 0.16);
+}
+
+.viewer-number {
+    color: var(--faint);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+.viewer-text {
+    overflow: hidden;
+    white-space: pre;
+    text-overflow: ellipsis;
+}
+
+.viewer-cut {
+    color: var(--accent);
 }
 
 .hidden { display: none !important; }
